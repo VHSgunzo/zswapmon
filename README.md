@@ -51,10 +51,23 @@ The project uses several optimizations for minimal, portable binaries:
 ### From Source
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/VHSgunzo/zswapmon.git
 cd zswapmon
 cargo build --release
 sudo cp target/x86_64-unknown-linux-musl/release/zswapmon /usr/local/bin/
+```
+
+### From [releases](https://github.com/VHSgunzo/zswapmon/releases)
+```
+wget https://github.com/VHSgunzo/zswapmon/releases/latest/download/zswapmon
+chmod +x zswapmon
+sudo mv zswapmon /usr/local/bin/
+```
+
+### From [AUR](https://aur.archlinux.org/packages/zswapmon-bin)
+
+```bash
+yay -S zswapmon-bin
 ```
 
 ## Usage
