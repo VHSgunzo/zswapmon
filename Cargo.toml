@@ -1,9 +1,8 @@
-cargo-features = ["panic-immediate-abort"]
-
 [package]
 name = "zswapmon"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Utility for monitoring zswap status and statistics"
 authors = ["VHSgunzo <vhsgunzo@gmail.com>"]
 license = "MIT"
@@ -18,7 +17,7 @@ opt-level = "z"
 strip = "symbols"
 debug  = false
 codegen-units = 1
-panic = "immediate-abort"
+panic = "abort"
 
 [profile.dev]
 opt-level = 0

@@ -25,26 +25,26 @@ A command-line utility for monitoring Linux zswap compressed swap cache statisti
 
 ### Prerequisites
 
-- Rust nightly toolchain
+- Rust stable toolchain, 1.85 or newer (`rust-toolchain.toml` selects `stable`)
 - x86_64-unknown-linux-musl target installed
 
 ```bash
-rustup toolchain install nightly
-rustup target add x86_64-unknown-linux-musl --toolchain nightly
+rustup toolchain install stable
+rustup target add x86_64-unknown-linux-musl --toolchain stable
 ```
 
 ### Build Configuration
 
 The project uses several optimizations for minimal, portable binaries:
 
-- **Toolchain**: Rust nightly (see [`rust-toolchain.toml`](rust-toolchain.toml))
+- **Toolchain**: Rust stable (see [`rust-toolchain.toml`](rust-toolchain.toml))
 - **Target**: `x86_64-unknown-linux-musl` for static linking (see [`.cargo/config.toml`](.cargo/config.toml))
 - **Release profile optimizations**:
   - Link-time optimization (LTO)
   - Maximum size optimization (`opt-level = "z"`)
   - Symbol stripping
   - Single codegen unit
-  - Immediate panic abort
+  - Panic abort (no unwinding)
 
 ## Installation
 
