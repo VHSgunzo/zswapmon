@@ -25,7 +25,7 @@ pub struct Args {
     parameters: bool,
 
     /// Enable continuous monitoring mode, refreshing display every N seconds
-    #[arg(short, long, value_name = "SECONDS")]
+    #[arg(short, long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
     monitor: Option<u64>,
 }
 
@@ -39,26 +39,33 @@ enum Unit {
     G,
 }
 
+// Only stored_pages and pool_total_size exist on every supported kernel (5.15+).
+// Other counters are None when the running kernel does not provide them.
 struct ZswapStats {
     stored_pages: u64,
-    stored_incompressible_pages: u64,
+    stored_incompressible_pages: Option<u64>, // 6.18+
     pool_total_size: u64,
-    written_back_pages: u64,
-    decompress_fail: u64,
-    reject_compress_poor: u64,
-    reject_compress_fail: u64,
-    reject_kmemcache_fail: u64,
-    reject_alloc_fail: u64,
-    reject_reclaim_fail: u64,
-    pool_limit_hit: u64,
+    written_back_pages: Option<u64>,
+    decompress_fail: Option<u64>, // 6.15+
+    reject_compress_poor: Option<u64>,
+    reject_compress_fail: Option<u64>, // 6.7+
+    reject_kmemcache_fail: Option<u64>,
+    reject_alloc_fail: Option<u64>,
+    reject_reclaim_fail: Option<u64>,
+    pool_limit_hit: Option<u64>,
+    same_filled_pages: Option<u64>, // up to 6.11
+    duplicate_entry: Option<u64>, // up to 6.8
 }
 
 struct ZswapParams {
-    enabled: String,
-    shrinker_enabled: String,
-    max_pool_percent: String,
-    compressor: String,
-    accept_threshold_percent: String,
+    enabled: Option<String>,
+    shrinker_enabled: Option<String>, // 6.8+
+    max_pool_percent: Option<String>,
+    compressor: Option<String>,
+    accept_threshold_percent: Option<String>,
+    zpool: Option<String>, // up to 6.17
+    same_filled_pages_enabled: Option<String>, // up to 6.7
+    non_same_filled_pages_enabled: Option<String>, // 5.18 - 6.7
 }
 
 
@@ -75,29 +82,81 @@ fn read_zswap_stats() -> Option<ZswapStats> {
 
     Some(ZswapStats {
         stored_pages: read_u64(base.join("stored_pages").as_path())?,
-        stored_incompressible_pages: read_u64(base.join("stored_incompressible_pages").as_path())?,
+        stored_incompressible_pages: read_u64(base.join("stored_incompressible_pages").as_path()),
         pool_total_size: read_u64(base.join("pool_total_size").as_path())?,
-        written_back_pages: read_u64(base.join("written_back_pages").as_path())?,
-        decompress_fail: read_u64(base.join("decompress_fail").as_path())?,
-        reject_compress_poor: read_u64(base.join("reject_compress_poor").as_path())?,
-        reject_compress_fail: read_u64(base.join("reject_compress_fail").as_path())?,
-        reject_kmemcache_fail: read_u64(base.join("reject_kmemcache_fail").as_path())?,
-        reject_alloc_fail: read_u64(base.join("reject_alloc_fail").as_path())?,
-        reject_reclaim_fail: read_u64(base.join("reject_reclaim_fail").as_path())?,
-        pool_limit_hit: read_u64(base.join("pool_limit_hit").as_path())?,
+        written_back_pages: read_u64(base.join("written_back_pages").as_path()),
+        decompress_fail: read_u64(base.join("decompress_fail").as_path()),
+        reject_compress_poor: read_u64(base.join("reject_compress_poor").as_path()),
+        reject_compress_fail: read_u64(base.join("reject_compress_fail").as_path()),
+        reject_kmemcache_fail: read_u64(base.join("reject_kmemcache_fail").as_path()),
+        reject_alloc_fail: read_u64(base.join("reject_alloc_fail").as_path()),
+        reject_reclaim_fail: read_u64(base.join("reject_reclaim_fail").as_path()),
+        pool_limit_hit: read_u64(base.join("pool_limit_hit").as_path()),
+        same_filled_pages: read_u64(base.join("same_filled_pages").as_path()),
+        duplicate_entry: read_u64(base.join("duplicate_entry").as_path()),
     })
 }
 
 fn read_zswap_params() -> Option<ZswapParams> {
     let base = Path::new("/sys/module/zswap/parameters");
+    if !base.is_dir() {
+        return None;
+    }
 
     Some(ZswapParams {
-        enabled: read_string(base.join("enabled").as_path())?,
-        shrinker_enabled: read_string(base.join("shrinker_enabled").as_path())?,
-        max_pool_percent: read_string(base.join("max_pool_percent").as_path())?,
-        compressor: read_string(base.join("compressor").as_path())?,
-        accept_threshold_percent: read_string(base.join("accept_threshold_percent").as_path())?,
+        enabled: read_string(base.join("enabled").as_path()),
+        shrinker_enabled: read_string(base.join("shrinker_enabled").as_path()),
+        max_pool_percent: read_string(base.join("max_pool_percent").as_path()),
+        compressor: read_string(base.join("compressor").as_path()),
+        accept_threshold_percent: read_string(base.join("accept_threshold_percent").as_path()),
+        zpool: read_string(base.join("zpool").as_path()),
+        same_filled_pages_enabled: read_string(base.join("same_filled_pages_enabled").as_path()),
+        non_same_filled_pages_enabled: read_string(base.join("non_same_filled_pages_enabled").as_path()),
     })
+}
+
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+fn debugfs_mounted() -> bool {
+    fs::read_to_string("/proc/mounts")
+        .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some("/sys/kernel/debug")
+            && l.split_whitespace().nth(2) == Some("debugfs")))
+        .unwrap_or(false)
+}
+
+/// Explain why reading the required zswap statistics failed.
+fn report_stats_error() {
+    let base = Path::new("/sys/kernel/debug/zswap");
+    for name in ["stored_pages", "pool_total_size"] {
+        let path = base.join(name);
+        let err = match fs::read_to_string(&path) {
+            Ok(_) => continue,
+            Err(e) => e,
+        };
+        eprintln!("Error: cannot read {}: {}", path.display(), err);
+        match err.kind() {
+            std::io::ErrorKind::PermissionDenied if !is_root() => {
+                eprintln!("zswap statistics are only readable by root. Try: sudo zswapmon");
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                eprintln!("Access was denied even though running as root.");
+                eprintln!("Kernel lockdown may be blocking debugfs; see /sys/kernel/security/lockdown");
+            }
+            std::io::ErrorKind::NotFound if !debugfs_mounted() => {
+                eprintln!("debugfs is not mounted. Mount it with:");
+                eprintln!("  sudo mount -t debugfs debugfs /sys/kernel/debug");
+            }
+            std::io::ErrorKind::NotFound if !base.exists() => {
+                eprintln!("{} does not exist: zswap is not available or not initialised in this kernel.", base.display());
+                eprintln!("Check /sys/module/zswap/parameters/enabled");
+            }
+            _ => {}
+        }
+        return;
+    }
+    eprintln!("Error: Cannot read zswap statistics from {}", base.display());
 }
 
 fn format_size(bytes: u64, unit: &Unit, si: bool) -> String {
@@ -144,11 +203,12 @@ fn format_size(bytes: u64, unit: &Unit, si: bool) -> String {
 }
 
 fn format_pages(pages: u64, bytes_per_page: u64, unit: &Unit, si: bool) -> String {
-    format_size(pages * bytes_per_page, unit, si)
+    format_size(pages.saturating_mul(bytes_per_page), unit, si)
 }
 
 fn get_page_size() -> u64 {
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if size > 0 { size as u64 } else { 4096 }
 }
 
 /// Table row that can have a separator line after it
@@ -176,6 +236,14 @@ impl Table {
         self
     }
 
+    /// Add a row only if the value is provided by the running kernel
+    fn optional_row(self, label: &str, value: Option<String>) -> Self {
+        match value {
+            Some(value) => self.data_row(label, value),
+            None => self,
+        }
+    }
+
     fn separator(mut self) -> Self {
         self.rows.push(Row::Separator);
         self
@@ -186,6 +254,18 @@ impl Table {
         let data_rows: Vec<_> = self.rows.iter().filter_map(|r| {
             if let Row::Data(l, v) = r { Some((l, v)) } else { None }
         }).collect();
+
+        // Drop leading, trailing and repeated separators left by hidden rows
+        let mut rows: Vec<&Row> = Vec::new();
+        for row in self.rows.iter() {
+            if matches!(row, Row::Separator) && matches!(rows.last(), None | Some(Row::Separator)) {
+                continue;
+            }
+            rows.push(row);
+        }
+        while matches!(rows.last(), Some(Row::Separator)) {
+            rows.pop();
+        }
 
         let label_width = data_rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
         let value_width = data_rows.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
@@ -205,20 +285,20 @@ impl Table {
         println!("║{:pad_left$}{}{:pad_right$}║", "", self.title, "", pad_left = pad_left, pad_right = pad_right);
 
         // Separator after title
-        println!("╠{}╣", border);
+        if !rows.is_empty() {
+            println!("╠{}╣", border);
+        }
 
         // Rows
-        let mut data_idx = 0;
-        for row in self.rows.iter() {
+        for (i, row) in rows.iter().enumerate() {
             match row {
                 Row::Data(label, value) => {
                     let space_between = total_width - label.len() - value.len();
                     println!("║{}{:>space$}{}║", label, "", value, space = space_between);
-                    // Add separator after each data row except the last
-                    if data_idx < data_rows.len() - 1 {
+                    // Add separator between consecutive data rows
+                    if matches!(rows.get(i + 1), Some(Row::Data(..))) {
                         println!("╟{}╢", separator_line);
                     }
-                    data_idx += 1;
                 }
                 Row::Separator => {
                     println!("╠{}╣", "═".repeat(total_width));
@@ -233,15 +313,16 @@ impl Table {
 
 fn build_summary_table(stats: &ZswapStats, unit: &Unit, si: bool, title: &str) -> Table {
     let bytes_per_page = get_page_size();
-    let uncompressed_size = stats.stored_pages * bytes_per_page;
+    let uncompressed_size = stats.stored_pages.saturating_mul(bytes_per_page);
     let compressed_size = stats.pool_total_size;
     let space_savings = uncompressed_size.saturating_sub(compressed_size);
 
     let uncompressed_str = format_size(uncompressed_size, unit, si);
     let compressed_str = format_size(compressed_size, unit, si);
     let savings_str = format_size(space_savings, unit, si);
-    let written_back_str = format_pages(stats.written_back_pages, bytes_per_page, unit, si);
-    let incompressible_str = format_pages(stats.stored_incompressible_pages, bytes_per_page, unit, si);
+    let written_back_str = stats.written_back_pages.map(|p| format_pages(p, bytes_per_page, unit, si));
+    let incompressible_str = stats.stored_incompressible_pages.map(|p| format_pages(p, bytes_per_page, unit, si));
+    let same_filled_str = stats.same_filled_pages.map(|p| format_pages(p, bytes_per_page, unit, si));
 
     let compression_str = if stats.stored_pages > 0 && compressed_size > 0 {
         let ratio = uncompressed_size as f64 / compressed_size as f64;
@@ -258,22 +339,27 @@ fn build_summary_table(stats: &ZswapStats, unit: &Unit, si: bool, title: &str) -
         .separator()
         .data_row("Compression Ratio", compression_str)
         .separator()
-        .data_row("Incompressible Pages", incompressible_str)
-        .data_row("Written Back to Swap", written_back_str)
+        .optional_row("Incompressible Pages", incompressible_str)
+        .optional_row("Same-Filled Pages", same_filled_str)
+        .optional_row("Written Back to Swap", written_back_str)
 }
 
 fn print_stats(stats: &ZswapStats, unit: &Unit, si: bool) {
     let mut table = build_summary_table(stats, unit, si, "ZSWAP STATISTICS");
+    let count = |c: Option<u64>| c.map(|c| c.to_string());
 
     table = table
+        .separator()
         .data_row("Stored Pages", stats.stored_pages.to_string())
-        .data_row("Pool Limit Hits", stats.pool_limit_hit.to_string())
-        .data_row("Decompress Failures", stats.decompress_fail.to_string())
-        .data_row("Reject: Compress Poor", stats.reject_compress_poor.to_string())
-        .data_row("Reject: Compress Fail", stats.reject_compress_fail.to_string())
-        .data_row("Reject: Kmemcache Fail", stats.reject_kmemcache_fail.to_string())
-        .data_row("Reject: Alloc Fail", stats.reject_alloc_fail.to_string())
-        .data_row("Reject: Reclaim Fail", stats.reject_reclaim_fail.to_string());
+        .optional_row("Same-Filled Pages Count", count(stats.same_filled_pages))
+        .optional_row("Duplicate Entries", count(stats.duplicate_entry))
+        .optional_row("Pool Limit Hits", count(stats.pool_limit_hit))
+        .optional_row("Decompress Failures", count(stats.decompress_fail))
+        .optional_row("Reject: Compress Poor", count(stats.reject_compress_poor))
+        .optional_row("Reject: Compress Fail", count(stats.reject_compress_fail))
+        .optional_row("Reject: Kmemcache Fail", count(stats.reject_kmemcache_fail))
+        .optional_row("Reject: Alloc Fail", count(stats.reject_alloc_fail))
+        .optional_row("Reject: Reclaim Fail", count(stats.reject_reclaim_fail));
 
     table.print();
 }
@@ -284,11 +370,14 @@ fn print_summary(stats: &ZswapStats, unit: &Unit, si: bool) {
 
 fn print_params(params: &ZswapParams) {
     let table = Table::new("ZSWAP PARAMETERS")
-        .data_row("Enabled", params.enabled.clone())
-        .data_row("Shrinker", params.shrinker_enabled.clone())
-        .data_row("Max Pool Percent", format!("{}%", params.max_pool_percent))
-        .data_row("Compressor", params.compressor.clone())
-        .data_row("Accept Threshold", format!("{}%", params.accept_threshold_percent));
+        .optional_row("Enabled", params.enabled.clone())
+        .optional_row("Shrinker", params.shrinker_enabled.clone())
+        .optional_row("Max Pool Percent", params.max_pool_percent.as_ref().map(|v| format!("{}%", v)))
+        .optional_row("Compressor", params.compressor.clone())
+        .optional_row("Zpool", params.zpool.clone())
+        .optional_row("Accept Threshold", params.accept_threshold_percent.as_ref().map(|v| format!("{}%", v)))
+        .optional_row("Same-Filled Pages", params.same_filled_pages_enabled.clone())
+        .optional_row("Non-Same-Filled Pages", params.non_same_filled_pages_enabled.clone());
 
     table.print();
 }
@@ -301,15 +390,6 @@ fn main() {
     let args = Args::parse();
 
     loop {
-        let stats = match read_zswap_stats() {
-            Some(s) => s,
-            None => {
-                eprintln!("Error: Cannot read zswap statistics. Are you root?");
-                eprintln!("Try running with: sudo zswapmon");
-                std::process::exit(1);
-            }
-        };
-
         if args.monitor.is_some() {
             clear_screen();
         }
@@ -319,10 +399,19 @@ fn main() {
                 print_params(&params);
                 std::process::exit(0);
             } else {
-                eprintln!("Error: Could not read zswap parameters");
+                eprintln!("Error: Could not read zswap parameters from /sys/module/zswap/parameters");
+                eprintln!("zswap is not available in this kernel.");
                 std::process::exit(1);
             }
         }
+
+        let stats = match read_zswap_stats() {
+            Some(s) => s,
+            None => {
+                report_stats_error();
+                std::process::exit(1);
+            }
+        };
 
         if args.stats {
             print_stats(&stats, &args.unit, args.si);
