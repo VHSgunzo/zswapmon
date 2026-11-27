@@ -18,33 +18,60 @@ A command-line utility for monitoring Linux zswap compressed swap cache statisti
 ## Requirements
 
 - **Root privileges**: Reading zswap statistics requires access to `/sys/kernel/debug/zswap/`
-- **Linux kernel**: zswap support (enabled by default in most modern kernels)
-- **Kernel 3.11+**: When zswap was introduced
+  (`--parameters` reads `/sys/module/zswap/parameters/` and does not need debugfs)
+- **debugfs** mounted at `/sys/kernel/debug`
+- **Linux kernel 5.15 or newer** with zswap support
+
+### Kernel compatibility
+
+The set of zswap counters and parameters differs between kernel versions.
+Only `stored_pages` and `pool_total_size` are required; every other row is
+shown only if the running kernel provides it, so output is kernel version
+dependent.
+
+| debugfs counter / module parameter | Kernels |
+|---|---|
+| `stored_pages`, `pool_total_size` (required) | all |
+| `written_back_pages`, `pool_limit_hit`, `reject_alloc_fail`, `reject_kmemcache_fail`, `reject_reclaim_fail`, `reject_compress_poor` | all |
+| `duplicate_entry` | 5.15 – 6.8 |
+| `same_filled_pages` | 5.15 – 6.11 |
+| `reject_compress_fail` | 6.7+ |
+| `decompress_fail` | 6.15+ |
+| `stored_incompressible_pages` | 6.18+ |
+| param `enabled`, `compressor`, `max_pool_percent`, `accept_threshold_percent` | all |
+| param `zpool` | 5.15 – 6.17 |
+| param `same_filled_pages_enabled` | 5.15 – 6.7 |
+| param `non_same_filled_pages_enabled` | 5.18 – 6.7 |
+| param `shrinker_enabled` | 6.8+ |
+
+On kernels up to 6.11, same-filled pages (e.g. all-zero pages) are counted in
+`stored_pages` but take no space in the compressed pool, so the compression
+ratio there is higher than the actual compressor ratio.
 
 ## Building from Source
 
 ### Prerequisites
 
-- Rust nightly toolchain
+- Rust stable toolchain, 1.85 or newer (`rust-toolchain.toml` selects `stable`)
 - x86_64-unknown-linux-musl target installed
 
 ```bash
-rustup toolchain install nightly
-rustup target add x86_64-unknown-linux-musl --toolchain nightly
+rustup toolchain install stable
+rustup target add x86_64-unknown-linux-musl --toolchain stable
 ```
 
 ### Build Configuration
 
 The project uses several optimizations for minimal, portable binaries:
 
-- **Toolchain**: Rust nightly (see [`rust-toolchain.toml`](rust-toolchain.toml))
+- **Toolchain**: Rust stable (see [`rust-toolchain.toml`](rust-toolchain.toml))
 - **Target**: `x86_64-unknown-linux-musl` for static linking (see [`.cargo/config.toml`](.cargo/config.toml))
 - **Release profile optimizations**:
   - Link-time optimization (LTO)
   - Maximum size optimization (`opt-level = "z"`)
   - Symbol stripping
   - Single codegen unit
-  - Immediate panic abort
+  - Panic abort (no unwinding)
 
 ## Installation
 
@@ -121,10 +148,8 @@ OPTIONS:
 ║Compressed Data                  14.6GiB║
 ╟────────────────────────────────────────╢
 ║Space Savings                     5.6GiB║
-╟────────────────────────────────────────╢
 ╠════════════════════════════════════════╣
 ║Compression Ratio    1.38x (27.6% saved)║
-╟────────────────────────────────────────╢
 ╠════════════════════════════════════════╣
 ║Incompressible Pages              7.7GiB║
 ╟────────────────────────────────────────╢
@@ -132,14 +157,20 @@ OPTIONS:
 ╚════════════════════════════════════════╝
 ```
 
+Rows for counters the running kernel does not provide are hidden
+(see [Kernel compatibility](#kernel-compatibility)). For example,
+"Incompressible Pages" only appears on 6.18+, and "Same-Filled Pages"
+only on kernels up to 6.11.
+
 ### Detailed Statistics
 
 ```bash
 sudo zswapmon --stats
 ```
 
-Shows additional metrics:
+Shows additional metrics (where provided by the kernel):
 - Stored pages count
+- Same-filled pages and duplicate entries (older kernels)
 - Pool limit hits
 - Decompression failures
 - Rejection reasons (compress poor/fail, kmemcache fail, alloc fail, reclaim fail)
@@ -150,12 +181,14 @@ Shows additional metrics:
 sudo zswapmon --parameters
 ```
 
-Displays:
+Displays (where provided by the kernel):
 - Enabled status
 - Shrinker configuration
 - Max pool percentage
 - Active compressor algorithm
+- Zpool allocator
 - Accept threshold percentage
+- Same-filled / non-same-filled page handling (older kernels)
 
 ## Understanding zswap
 
@@ -183,16 +216,21 @@ This improves performance by reducing disk I/O while using less RAM than uncompr
 - `shrinker_enabled`: Enable memory pressure shrinking (Y/N)
 - `max_pool_percent`: Maximum RAM percentage for compressed pool (default: 25%)
 - `compressor`: Compression algorithm (lzo, lz4, zstd, deflate)
+- `zpool`: Compressed memory allocator (zbud, z3fold, zsmalloc; kernels up to 6.17)
 - `accept_threshold_percent`: Pool utilization threshold for accepting new pages
+- `same_filled_pages_enabled` / `non_same_filled_pages_enabled`: Which page types zswap stores (kernels up to 6.7)
 
 ## Troubleshooting
 
-### "Cannot read zswap statistics"
+### "Error: cannot read /sys/kernel/debug/zswap/..."
 
-Ensure you're running with root privileges:
-```bash
-sudo zswapmon
-```
+The message names the file and the reason, followed by a hint:
+
+- **Permission denied**, not root: run with `sudo zswapmon`.
+- **Permission denied** as root: kernel lockdown (often enabled with Secure
+  Boot) blocks debugfs; check `cat /sys/kernel/security/lockdown`.
+- **No such file or directory**: debugfs is not mounted, or zswap is not
+  available in this kernel (see below).
 
 ### zswap not enabled
 
